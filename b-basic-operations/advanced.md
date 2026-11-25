@@ -63,6 +63,23 @@ XACK orders order-workers <entry-id>
 
 Replace `<entry-id>` with the ID returned by `XREADGROUP`. Production consumers should also handle pending messages and retries.
 
+### Recover stuck entries and cap stream size
+
+If a consumer crashes after reading but before `XACK`, its entries stay pending. Inspect them, then let another consumer claim entries idle for more than 60 seconds (Redis 6.2+):
+
+```redis
+XPENDING orders order-workers
+XAUTOCLAIM orders order-workers worker-2 60000 0-0 COUNT 10
+```
+
+`XAUTOCLAIM` returns a cursor to pass on the next call; `0-0` means the scan is complete. Streams grow until trimmed, so cap them to keep memory bounded:
+
+```redis
+XTRIM orders MAXLEN ~ 10000
+```
+
+The `~` lets Redis trim approximately, which is more efficient than an exact limit. You can also trim on insert with `XADD orders MAXLEN ~ 10000 * ...`.
+
 ## A few useful habits
 
 - Use `SCAN` to explore keys incrementally; `KEYS *` can block a busy server.
@@ -153,6 +170,81 @@ LATENCY LATEST
 
 `SLOWLOG` records commands that exceed the configured execution threshold. Large key scans, unbounded collection reads, expensive scripts, and huge pipeline batches can affect latency. In production, use `SCAN`-family commands for incremental keyspace traversal and monitor memory, latency, evictions, and persistence health over time.
 
+## Sliding-window rate limiter with a sorted set
+
+Store one member per request, scored by its timestamp in milliseconds. Remove entries older than the window, add the current request, and count what remains. Your application computes the timestamps; here "now" is `1764000060000` and the window is 60 seconds:
+
+```redis
+MULTI
+ZREMRANGEBYSCORE rate:user-42 0 1764000000000
+ZADD rate:user-42 1764000060000 req-1764000060000-a1
+ZCARD rate:user-42
+PEXPIRE rate:user-42 60000
+EXEC
+```
+
+If the `ZCARD` reply exceeds the limit (for example, 100 requests per minute), reject the request. Members must be unique, so add a random suffix in case two requests share a millisecond. This version also counts rejected requests; move the logic into a Lua script if you only want to record allowed ones.
+
+## HyperLogLog: approximate unique counts
+
+HyperLogLog counts distinct items using at most about 12 KB per key, with a standard error of about 0.81%. It is useful for unique visitors where an exact list is not needed:
+
+```redis
+PFADD visitors:2026-11-24 alice bob chandra
+PFADD visitors:2026-11-25 bob dev
+PFCOUNT visitors:2026-11-25
+PFCOUNT visitors:2026-11-24 visitors:2026-11-25
+PFMERGE visitors:week visitors:2026-11-24 visitors:2026-11-25
+```
+
+Counting several keys together returns the approximate union (here 4). You cannot list the members back out of a HyperLogLog.
+
+## Bitmaps: compact yes/no flags
+
+A bitmap is a string treated as an array of bits. With numeric user IDs, one bit per user tracks daily activity very compactly:
+
+```redis
+SETBIT active:2026-11-25 100 1
+SETBIT active:2026-11-25 205 1
+GETBIT active:2026-11-25 100
+BITCOUNT active:2026-11-25
+```
+
+Combine days with `BITOP`, for example users active on both days:
+
+```redis
+SETBIT active:2026-11-24 100 1
+BITOP AND active:both active:2026-11-24 active:2026-11-25
+BITCOUNT active:both
+```
+
+Bitmaps work best with dense, small integer IDs. Setting a very high bit offset allocates memory up to that offset.
+
+## Geospatial: find nearby places
+
+Geo commands store longitude and latitude (in that order) in a sorted set and search by distance (`GEOSEARCH` needs Redis 6.2+):
+
+```redis
+GEOADD stores 80.2707 13.0827 chennai 77.5946 12.9716 bengaluru 73.8567 18.5204 pune
+GEODIST stores chennai bengaluru km
+GEOSEARCH stores FROMLONLAT 80.2707 13.0827 BYRADIUS 400 km ASC WITHDIST
+```
+
+The search returns Chennai and Bengaluru (about 290 km away), nearest first. Pune is outside the radius.
+
+## Expire individual hash fields
+
+Redis 7.4 added per-field expiration for hashes. Older versions can only expire the whole key:
+
+```redis
+HSET session:9 user alice csrf t0k3n
+HEXPIRE session:9 300 FIELDS 1 csrf
+HTTL session:9 FIELDS 2 csrf user
+HPERSIST session:9 FIELDS 1 csrf
+```
+
+`HTTL` returns `-1` for a field with no expiration and `-2` for a missing field, matching `TTL`. The `FIELDS` count must match the number of field names that follow.
+
 ## Further reading
 
 - [Redis pipelining](https://redis.io/docs/latest/develop/using-commands/pipelining/)
@@ -161,3 +253,4 @@ LATENCY LATEST
 - [Redis replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/)
 - [Redis Cluster scaling](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/)
 - [Distributed locks with Redis](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+- [Redis data types (HyperLogLog, bitmaps, geospatial)](https://redis.io/docs/latest/develop/data-types/)
